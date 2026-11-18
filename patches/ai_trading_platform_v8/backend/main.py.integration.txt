@@ -1,0 +1,6 @@
+Add to backend/main.py imports:
+    from backend.routes import telegram_link
+
+Add inside create_app(), alongside the other routers:
+    app.include_router(telegram_link.router, prefix="/api")
+Do not replace the existing app factory or router registrations.

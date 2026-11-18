@@ -1,0 +1,30 @@
+services:
+  telegram-api:
+    build: .
+    container_name: telegram_trading_api
+    env_file: .env
+    ports: ["11010:8000"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    networks: [ai_trading_network]
+    restart: unless-stopped
+  telegram-worker:
+    build: .
+    container_name: telegram_trading_worker
+    command: celery -A app.celery_app.celery_app worker --loglevel=INFO --queues=notifications
+    env_file: .env
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    networks: [ai_trading_network]
+    restart: unless-stopped
+  miniapp:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-https://your-api-domain.example}
+        VITE_GOOGLE_CLIENT_ID: ${VITE_GOOGLE_CLIENT_ID:-}
+    container_name: telegram_trading_miniapp
+    ports: ["8080:80"]
+    networks: [ai_trading_network]
+    restart: unless-stopped
+networks:
+  ai_trading_network:
+    external: true

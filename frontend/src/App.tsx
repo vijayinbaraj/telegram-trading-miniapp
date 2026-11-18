@@ -1,0 +1,601 @@
+import { useEffect, useState } from 'react'
+import {
+  Activity, ArrowLeftRight, Bell, BellRing, CheckCircle2, ChevronRight,
+  CircleAlert, CreditCard, LayoutDashboard, LogOut, Shield, UserRound,
+  Wallet, Zap, RefreshCw, Send, PlugZap, ClipboardList, Layers
+} from 'lucide-react'
+import {
+  getAuthStatus, registerGoogleCode, loginGoogleCode, setToken, getDashboard,
+  saveAlertPreferences, getProfile, saveProfileCredentials, testTelegram,
+  testExchange, logout, startMobileGoogleOAuth, consumeMobileGoogleOAuth,
+  registerPassword, loginPassword, getPositions, getOrders
+} from './api'
+
+type Tab = 'home' | 'alerts' | 'settings' | 'exchange' | 'plan' | 'preferences' | 'profile' | 'exceptions' | 'positions' | 'orders'
+type Dashboard = { exchange: string; mode: string; wallet_balance: string | number | null; wallet_balance_inr?: string | number | null; open_positions: number | null; active_orders: number | null; unrealized_pnl: number | null; notice?: string; activity_error?: string | null }
+type GoogleCodeResponse = { code?: string; error?: string; error_description?: string }
+
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || ''
+
+const formatInr = (value: unknown) => {
+  if (value === null || value === undefined || value === '') return '—'
+  const amount = Number(value)
+  if (!Number.isFinite(amount)) return '—'
+  return new Intl.NumberFormat('en-IN', {
+    style: 'currency',
+    currency: 'INR',
+    maximumFractionDigits: 2,
+  }).format(amount)
+}
+
+export default function App() {
+  const [tab, setTab] = useState<Tab>('home')
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [authState, setAuthState] = useState<'register'|'login'|'inactive'|'blocked'|'app'>('login')
+  const [initData, setInitData] = useState('')
+  const [name, setName] = useState('Trader')
+  const [dashboard, setDashboard] = useState<Dashboard | null>(null)
+  const [mode, setMode] = useState<'paper' | 'live'>('paper')
+  const [registerMode, setRegisterMode] = useState<'paper'|'live'>('paper')
+  const [confirmMode, setConfirmMode] = useState<'paper' | 'live' | null>(null)
+  const [alertsEnabled, setAlertsEnabled] = useState(true)
+  const [preferences, setPreferences] = useState({trading_alerts:true, exceptions:true, account_notifications:true})
+  const [profile, setProfile] = useState<any>(null)
+  const [apiKey, setApiKey] = useState('')
+  const [apiSecret, setApiSecret] = useState('')
+  const [telegramToken, setTelegramToken] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [googleReady, setGoogleReady] = useState(false)
+  const [authMethod, setAuthMethod] = useState<'password'|'google'>('password')
+  const [authEmail, setAuthEmail] = useState('')
+  const [authPassword, setAuthPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [positions, setPositions] = useState<any[]>([])
+  const [orders, setOrders] = useState<any[]>([])
+  const [activityLoading, setActivityLoading] = useState(false)
+  const [activityError, setActivityError] = useState('')
+
+  useEffect(() => {
+    const init = async () => {
+      try {
+        const tg = window.Telegram?.WebApp
+        if (!tg) {
+          throw new Error('Telegram Web App could not be initialized.')
+        }
+        tg.ready()
+        tg.expand()
+        const telegramInitData = tg.initData
+        if (!telegramInitData) {
+          throw new Error(
+            'Telegram authentication data is unavailable. Please reopen the Mini App from the bot.'
+          )
+        }
+        setInitData(telegramInitData)
+        const saved = sessionStorage.getItem('miniapp_session')
+        if (saved) {
+          setToken(saved)
+          try {
+            const data = await getDashboard()
+            setDashboard(data); setMode(data.mode === 'LIVE' ? 'live' : 'paper')
+            setAuthState('app')
+            return
+          } catch { setToken(''); sessionStorage.removeItem('miniapp_session') }
+        }
+        const status = await getAuthStatus(telegramInitData)
+        if (status.status === 'unregistered') setAuthState('register')
+        else if (status.status === 'inactive') setAuthState('inactive')
+        else if (status.status === 'blocked') setAuthState('blocked')
+        else setAuthState('login')
+      } catch (e) { setError(e instanceof Error ? e.message : 'Unable to initialize') }
+      finally { setLoading(false) }
+    }
+    void init()
+  }, [])
+
+  // Wait for Google Identity Services before trying to render its sign-in button.
+  useEffect(() => {
+    const scriptSelector = 'script[src="https://accounts.google.com/gsi/client"]'
+    let script = document.querySelector<HTMLScriptElement>(scriptSelector)
+
+    const markReadyIfAvailable = () => {
+      if (window.google?.accounts?.oauth2) {
+        setGoogleReady(true)
+        setError('')
+        return true
+      }
+      return false
+    }
+
+    if (markReadyIfAvailable()) return
+
+    // If the script tag is absent, add it dynamically.
+    if (!script) {
+      script = document.createElement('script')
+      script.src = 'https://accounts.google.com/gsi/client'
+      script.async = true
+      script.defer = true
+      document.head.appendChild(script)
+    }
+
+    const handleLoad = () => {
+      if (!markReadyIfAvailable()) {
+        setError('Google Sign-In loaded, but its OAuth authorization service is unavailable.')
+      }
+    }
+
+    const handleError = () => {
+      setError('Unable to load Google Sign-In. Check the connection and reopen the Mini App.')
+    }
+
+    script.addEventListener('load', handleLoad)
+    script.addEventListener('error', handleError)
+
+    // Cover a script that completed between the initial check and listener setup.
+    if (markReadyIfAvailable()) {
+      script.removeEventListener('load', handleLoad)
+      script.removeEventListener('error', handleError)
+    }
+
+    return () => {
+      script?.removeEventListener('load', handleLoad)
+      script?.removeEventListener('error', handleError)
+    }
+  }, [])
+
+
+
+  const submitPasswordAuth = async () => {
+    if (busy) return
+    setError('')
+    setNotice('')
+    const email = authEmail.trim().toLowerCase()
+    if (!/^[^@\s]+@gmail\.com$/i.test(email)) {
+      setError('Please enter a valid Gmail address ending in @gmail.com.')
+      return
+    }
+    if (authState === 'register') {
+      if (authPassword.length < 10) {
+        setError('Password must contain at least 10 characters.')
+        return
+      }
+      if (authPassword !== confirmPassword) {
+        setError('Passwords do not match.')
+        return
+      }
+    } else if (!authPassword) {
+      setError('Please enter your password.')
+      return
+    }
+
+    setBusy(true)
+    try {
+      if (authState === 'register') {
+        const result = await registerPassword(
+          initData, email, authPassword, registerMode === 'paper'
+        )
+        setAuthState('login')
+        setAuthPassword('')
+        setConfirmPassword('')
+        setNotice(result.message || 'Registration successful. Please log in.')
+      } else {
+        const result = await loginPassword(initData, email, authPassword)
+        setName(result.user?.full_name || 'Trader')
+        const data = await getDashboard()
+        setDashboard(data)
+        setMode(data.mode === 'LIVE' ? 'live' : 'paper')
+        setAuthState('app')
+        setAuthPassword('')
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Unable to authenticate')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const startMobileGoogleSignIn = async () => {
+    if (busy) return
+    const tg = (window as any).Telegram?.WebApp
+    if (!tg?.openLink) {
+      setError('Telegram cannot open the Google sign-in page. Please update Telegram and try again.')
+      return
+    }
+    if (!initData) {
+      setError('Telegram authentication data is missing. Reopen the Mini App from the bot.')
+      return
+    }
+
+    setBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      const transaction = await startMobileGoogleOAuth(
+        initData,
+        authState === 'register' ? 'register' : 'login',
+        registerMode === 'paper',
+      )
+
+      // Telegram's openLink is used for an external browser, not an embedded popup.
+      tg.openLink(transaction.authorization_url)
+      setNotice('Complete Google sign-in in your browser, then return to Telegram.')
+
+      // Poll while the user completes Google sign-in in the external browser.
+      for (let attempt = 0; attempt < 150; attempt += 1) {
+        await new Promise(resolve => window.setTimeout(resolve, 2000))
+        const result = await consumeMobileGoogleOAuth(
+          transaction.transaction_id,
+          transaction.poll_secret,
+        )
+
+        if (result.status === 'pending') continue
+
+        if (result.status === 'registered') {
+          setAuthState('login')
+          setNotice('Registration successful. You can now log in with your Google account.')
+          return
+        }
+
+        if (result.status === 'complete' && result.access_token) {
+          setToken(result.access_token)
+          sessionStorage.setItem('miniapp_session', result.access_token)
+          setName(result.user?.full_name || 'Trader')
+          const data = await getDashboard()
+          setDashboard(data)
+          setMode(data.mode === 'LIVE' ? 'live' : 'paper')
+          setAuthState('app')
+          setNotice('')
+          return
+        }
+      }
+
+      throw new Error('Google sign-in timed out. Please try again.')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Mobile Google sign-in failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const startGoogleSignIn = () => {
+    const tg = (window as any).Telegram?.WebApp
+    if (tg?.platform === 'android') {
+      void startMobileGoogleSignIn()
+      return
+    }
+    if (busy) return
+
+    if (!GOOGLE_CLIENT_ID) {
+      setError('Google Sign-In is not configured. Set VITE_GOOGLE_CLIENT_ID in the frontend build environment.')
+      return
+    }
+
+    if (!window.google?.accounts?.oauth2) {
+      setError('Google Sign-In is still loading. Please try again.')
+      return
+    }
+
+    setError('')
+    setNotice('')
+
+    try {
+      const codeClient = window.google.accounts.oauth2.initCodeClient({
+        client_id: GOOGLE_CLIENT_ID,
+        scope: 'openid email profile',
+        ux_mode: 'popup',
+        select_account: true,
+        callback: async (response: GoogleCodeResponse) => {
+          console.log('[GOOGLE LOGIN] Callback received');
+          console.log('[GOOGLE LOGIN] Has code:', !!response.code);
+          console.log('[GOOGLE LOGIN] Error:', response.error || 'none');
+          if (response.error) {
+            setError(response.error_description || `Google sign-in failed: ${response.error}`)
+            return
+          }
+
+          if (!response.code) {
+            setError('Google did not return an authorization code. Please try again.')
+            return
+          }
+
+          setBusy(true)
+          setError('')
+          setNotice('')
+
+          try {
+            if (authState === 'register') {
+              const result = await registerGoogleCode(
+                initData,
+                response.code,
+                registerMode === 'paper'
+              )
+              setNotice(result.message || 'Registration successful. Return to Telegram and press Login.')
+              window.Telegram?.WebApp?.close?.()
+            } else {
+              const result = await loginGoogleCode(initData, response.code)
+              setName(result.user?.full_name || 'Trader')
+              const data = await getDashboard()
+              setDashboard(data)
+              setMode(data.mode === 'LIVE' ? 'live' : 'paper')
+              setAuthState('app')
+            }
+          } catch (e) {
+            setError(e instanceof Error ? e.message : 'Google authentication failed')
+          } finally {
+            setBusy(false)
+          }
+        },
+        error_callback: (error: { type?: string; message?: string }) => {
+          if (error?.type === 'popup_closed') {
+            setError('Google sign-in was cancelled. Please try again.')
+          } else if (error?.type === 'popup_failed_to_open') {
+            setError('Google sign-in popup was blocked. Allow popups and try again.')
+          } else {
+            setError(error?.message || 'Unable to open Google sign-in.')
+          }
+        },
+      })
+
+      // Must be called directly from the user's click to allow the popup.
+      codeClient.requestCode()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Unable to start Google sign-in')
+    }
+  }
+
+
+  useEffect(() => {
+    if (authState !== 'app') return
+    void getProfile().then(setProfile).catch(e => setError(e instanceof Error ? e.message : 'Unable to load profile'))
+  }, [authState])
+
+  const positionSide = (p: any) => {
+    const explicit = p.side ?? p.position_side ?? p.position_type
+    if (explicit) {
+      const value = String(explicit).toUpperCase()
+      if (['BUY', 'B', 'LONG'].includes(value)) return 'LONG'
+      if (['SELL', 'S', 'SHORT'].includes(value)) return 'SHORT'
+      return value
+    }
+    const qty = Number(p.active_pos ?? p.quantity ?? p.position_qty ?? 0)
+    return qty > 0 ? 'LONG' : qty < 0 ? 'SHORT' : '—'
+  }
+
+  const positionPnl = (p: any) => {
+    const value = p.unrealized_pnl ?? p.unrealizedPnl ?? p.unrealized_profit ?? p.unrealizedProfit ?? p.pnl
+    if (value === undefined || value === null || value === '') return null
+    // Never label an unknown/non-INR backend value as INR.
+    if (p.unrealized_pnl_currency !== 'INR') return null
+    return formatInr(value)
+  }
+
+  const loadActivity = async (kind: 'positions' | 'orders') => {
+    setActivityLoading(true)
+    setActivityError('')
+    try {
+      const response = kind === 'positions' ? await getPositions() : await getOrders()
+      const records = Array.isArray(response)
+        ? response
+        : Array.isArray(response?.[kind])
+          ? response[kind]
+          : Array.isArray(response?.data)
+            ? response.data
+            : Array.isArray(response?.items)
+              ? response.items
+              : []
+      if (kind === 'positions') setPositions(records)
+      else setOrders(records)
+    } catch (e) {
+      setActivityError(e instanceof Error ? e.message : `Unable to load ${kind}`)
+    } finally {
+      setActivityLoading(false)
+    }
+  }
+
+  const go = (next: Tab) => {
+    window.Telegram?.WebApp?.HapticFeedback?.impactOccurred('light')
+    setTab(next)
+    setError('')
+    setNotice('')
+    if (next === 'positions' || next === 'orders') void loadActivity(next)
+    else setActivityError('')
+  }
+  const saveExchange = async () => {
+    if (!confirmMode) return
+    setError('Exchange switching is currently disabled until active-order and active-position safety checks are connected.')
+    setConfirmMode(null)
+  }
+  const saveCredentials = async () => {
+    setBusy(true); setError(''); setNotice('')
+    try {
+      const result = await saveProfileCredentials({
+        ...(apiKey ? {coindcx_api_key:apiKey} : {}),
+        ...(apiSecret ? {coindcx_api_secret:apiSecret} : {}),
+        ...(telegramToken ? {telegram_bot_token:telegramToken} : {}),
+      })
+      setProfile(result); setApiKey(''); setApiSecret(''); setTelegramToken('')
+      setNotice('Profile credentials saved. Run the connectivity tests before enabling Live trading.')
+    } catch (e) { setError(e instanceof Error ? e.message : 'Unable to save credentials') }
+    finally { setBusy(false) }
+  }
+  const runConnectionTest = async (kind:'telegram'|'exchange') => {
+    setBusy(true); setError(''); setNotice('')
+    try {
+      const result = kind === 'telegram' ? await testTelegram() : await testExchange()
+      setNotice(result.message)
+      setProfile(await getProfile())
+    } catch (e) { setError(e instanceof Error ? e.message : `${kind} test failed`); setProfile(await getProfile().catch(() => profile)) }
+    finally { setBusy(false) }
+  }
+  const doLogout = async () => { setBusy(true); try { await logout() } finally { window.Telegram?.WebApp?.close?.(); setBusy(false) } }
+
+  if (loading) return <div className="center"><div className="spinner"/><p>Connecting securely…</p></div>
+  if (error && !['app', 'register', 'login'].includes(authState)) return (<div className="center error-screen"><Shield size={38}/><h2>Unable to connect</h2><p>{error}</p><small>Please reopen the application from Telegram.</small></div>)
+  if (authState === 'inactive' || authState === 'blocked') return <div className="center"><Shield size={38}/><h2>Account unavailable</h2><p>{authState === 'inactive' ? 'Your account is inactive.' : 'We could not safely identify your account.'} Please contact support.</p></div>
+  if (authState === 'register' || authState === 'login') return <div className="center auth-screen">
+    <div className="brand-mark"><Activity size={22}/></div>
+    <h1>{authState === 'register' ? 'Create your account' : 'Welcome back'}</h1>
+    <p>{authState === 'register'
+      ? 'Choose Gmail or Gmail address and password to create your account.'
+      : 'Choose how you want to sign in.'}</p>
+
+    {authState === 'register' && <div className="auth-mode"><b>Choose your exchange</b>
+      <button className={registerMode==='paper'?'selected':''} onClick={() => setRegisterMode('paper')}><Shield size={18}/> Paper Exchange <span>Practice without exchange credentials</span></button>
+      <button className={registerMode==='live'?'selected':''} onClick={() => setRegisterMode('live')}><Activity size={18}/> Live CoinDCX <span>Requires API credentials and successful connectivity test before live trading</span></button>
+    </div>}
+
+    <div className="button-row" style={{width:'100%'}}>
+      <button type="button" className={authMethod==='password'?'btn-primary':'btn-secondary'} onClick={() => {setAuthMethod('password');setError('')}}>Gmail + Password</button>
+      <button type="button" className={authMethod==='google'?'btn-primary':'btn-secondary'} onClick={() => {setAuthMethod('google');setError('')}}>Google</button>
+    </div>
+
+    {authMethod === 'password' ? <div className="profile-section" style={{width:'100%',textAlign:'left'}}>
+      <label>Gmail address (User ID)</label>
+      <input
+        type="email"
+        value={authEmail}
+        onChange={e => setAuthEmail(e.target.value)}
+        placeholder="name@gmail.com"
+        autoComplete="username"
+        maxLength={254}
+      />
+      <label>Password</label>
+      <input
+        type="password"
+        value={authPassword}
+        onChange={e => setAuthPassword(e.target.value)}
+        placeholder="Enter password"
+        autoComplete={authState === 'register' ? 'new-password' : 'current-password'}
+        maxLength={128}
+      />
+      {authState === 'register' && <>
+        <label>Confirm password</label>
+        <input
+          type="password"
+          value={confirmPassword}
+          onChange={e => setConfirmPassword(e.target.value)}
+          placeholder="Confirm password"
+          autoComplete="new-password"
+          maxLength={128}
+        />
+        <small>Password must contain at least 10 characters.</small>
+      </>}
+      <button type="button" className="btn-primary full" disabled={busy} onClick={() => void submitPasswordAuth()}>
+        {busy ? 'Please wait…' : authState === 'register' ? 'Register with Gmail + Password' : 'Login with Gmail + Password'}
+      </button>
+    </div> : <>
+      {!GOOGLE_CLIENT_ID && <div className="notice warning">Google sign-in is not configured. Set VITE_GOOGLE_CLIENT_ID in the frontend build environment.</div>}
+      <button
+        type="button"
+        className="btn-primary full google-button"
+        onClick={startGoogleSignIn}
+        disabled={busy || (((window as any).Telegram?.WebApp?.platform !== 'android') && !googleReady) || !GOOGLE_CLIENT_ID}
+      >
+        {busy ? 'Please wait…' : authState === 'register' ? 'Register with Google' : 'Continue with Google'}
+      </button>
+    </>}
+    {busy && <div className="spinner"/>}
+    {error && <div className="notice warning">{error}</div>}
+    {notice && <div className="notice">{notice}</div>}
+    <small>Both methods are linked to the verified Telegram account that opened this Mini App.</small>
+    <button type="button" className="text-button" onClick={() => {
+      setAuthState(authState === 'register' ? 'login' : 'register')
+      setError('')
+      setNotice('')
+      setAuthPassword('')
+      setConfirmPassword('')
+    }}>
+      {authState === 'register' ? 'Already registered? Login' : 'New customer? Register'}
+    </button>
+  </div>
+
+  if (!authState || authState !== 'app') return <div className="center"><p>Authentication required.</p></div>
+
+  return <div className="app-shell">
+    <header className="topbar">
+      <div className="brand-mark"><Activity size={20}/></div>
+      <div className="brand"><b>AI Trading</b><span>Trading workspace</span></div>
+      <div className={`mode-pill ${mode}`}>{mode === 'paper' ? 'PAPER' : 'LIVE'}</div>
+    </header>
+    <main>
+      {error && <div className="notice warning"><CircleAlert size={17}/><span>{error}</span></div>}
+      {notice && <div className="notice"><CheckCircle2 size={17}/><span>{notice}</span></div>}
+      {tab === 'home' && <section>
+        <div className="greeting"><span>WELCOME BACK</span><h1>{name}</h1><p>Your trading overview at a glance.</p></div>
+        <div className={`environment ${mode}`}><div className="env-top"><span>ACTIVE ENVIRONMENT</span><span className="live-dot"/></div><h2>{mode === 'paper' ? 'Paper Exchange' : 'Live CoinDCX'}</h2><p>{mode === 'paper' ? 'Simulated trading environment' : 'Real exchange account'}</p><button className="text-button" onClick={() => go('exchange')}>Manage exchange <ChevronRight size={16}/></button></div>
+        <div className="section-heading"><h3>Account overview</h3><span>Current status</span></div>
+        <div className="stats-grid"><Stat icon={<Wallet/>} label="Wallet balance" value={formatInr(dashboard?.wallet_balance_inr ?? dashboard?.wallet_balance)}/><Stat icon={<Activity/>} label="Open positions" value={String(dashboard?.open_positions ?? '—')}/><Stat icon={<Zap/>} label="Active orders" value={String(dashboard?.active_orders ?? '—')}/><Stat icon={<Activity/>} label="Unrealized P&L" value={formatInr(dashboard?.unrealized_pnl)}/></div>
+        {dashboard?.notice && <div className="notice"><CircleAlert size={17}/><span>{dashboard.notice}</span></div>}
+        {dashboard?.activity_error && <div className="notice warning"><CircleAlert size={17}/><span>{dashboard.activity_error}</span></div>}
+        <div className="section-heading"><h3>Quick access</h3></div><div className="quick-grid"><Quick icon={<Layers/>} title="Positions" subtitle="View open positions" onClick={() => go('positions')}/><Quick icon={<ClipboardList/>} title="Orders" subtitle="View active orders" onClick={() => go('orders')}/><Quick icon={<Bell/>} title="Alerts" subtitle="Trading updates" onClick={() => go('alerts')}/><Quick icon={<CreditCard/>} title="Subscription" subtitle="Plan & validity" onClick={() => go('plan')}/><Quick icon={<ArrowLeftRight/>} title="Exchange" subtitle="Live or paper" onClick={() => go('exchange')}/><Quick icon={<UserRound/>} title="My profile" subtitle="Credentials & connectivity" onClick={() => go('profile')}/></div>
+      </section>}
+      {tab === 'positions' && <Page title="Open Positions" subtitle={`${mode === 'paper' ? 'Paper Exchange' : 'Live CoinDCX'} · Active positions`}>
+        <button className="btn-secondary full activity-refresh" disabled={activityLoading} onClick={() => void loadActivity('positions')}>
+          <RefreshCw size={15}/> {activityLoading ? 'Refreshing…' : 'Refresh positions'}
+        </button>
+        {activityError && <div className="notice warning">{activityError}</div>}
+        {activityLoading && <div className="activity-loading"><div className="spinner"/><span>Loading positions…</span></div>}
+        {!activityLoading && !activityError && positions.length === 0 && <div className="empty-state"><Layers size={34}/><b>No open positions</b><p>You currently have no active positions.</p></div>}
+        {!activityLoading && positions.map((p, i) => <div className="activity-card" key={p.id ?? `${p.pair ?? p.symbol ?? 'position'}-${i}`}>
+          <div className="activity-card-head"><b>{p.pair ?? p.symbol ?? 'Unknown pair'}</b><span className={`side-pill ${positionSide(p).toLowerCase()}`}>{positionSide(p)}</span></div>
+          <div className="activity-grid">
+            <ActivityValue label="Quantity" value={p.active_pos}/>
+            <ActivityValue label="Entry price" value={p.avg_price}/>
+            <ActivityValue label="Mark price" value={p.mark_price}/>
+            <ActivityValue label="Leverage" value={p.leverage == null ? null : `${p.leverage}x`}/>
+            <ActivityValue label="Liquidation price" value={p.liquidation_price}/>
+            <ActivityValue label="Locked margin" value={p.locked_margin}/>
+            <ActivityValue label="Unrealized P&L" value={positionPnl(p)}/>
+          </div>
+          {p.updated_at && <small className="activity-date">Updated: {String(p.updated_at)}</small>}
+        </div>)}
+      </Page>}
+      {tab === 'orders' && <Page title="Active Orders" subtitle={`${mode === 'paper' ? 'Paper Exchange' : 'Live CoinDCX'} · Open orders`}>
+        <button className="btn-secondary full activity-refresh" disabled={activityLoading} onClick={() => void loadActivity('orders')}>
+          <RefreshCw size={15}/> {activityLoading ? 'Refreshing…' : 'Refresh orders'}
+        </button>
+        {activityError && <div className="notice warning">{activityError}</div>}
+        {activityLoading && <div className="activity-loading"><div className="spinner"/><span>Loading orders…</span></div>}
+        {!activityLoading && !activityError && orders.length === 0 && <div className="empty-state"><ClipboardList size={34}/><b>No active orders</b><p>You currently have no open orders.</p></div>}
+        {!activityLoading && orders.map((o, i) => <div className="activity-card" key={o.id ?? `${o.pair ?? o.symbol ?? 'order'}-${i}`}>
+          <div className="activity-card-head"><b>{o.pair ?? o.symbol ?? 'Unknown pair'}</b><span className={`side-pill ${String(o.side ?? '').toLowerCase()}`}>{o.side ?? '—'}</span></div>
+          <div className="activity-grid">
+            <ActivityValue label="Order type" value={o.order_type}/>
+            <ActivityValue label="Status" value={o.status}/>
+            <ActivityValue label="Price" value={o.price}/>
+            <ActivityValue label="Total quantity" value={o.total_quantity}/>
+            <ActivityValue label="Remaining quantity" value={o.remaining_quantity}/>
+            <ActivityValue label="Leverage" value={o.leverage == null ? null : `${o.leverage}x`}/>
+          </div>
+          {o.created_at && <small className="activity-date">Created: {String(o.created_at)}</small>}
+        </div>)}
+      </Page>}
+      {tab === 'alerts' && <Page title="Notification centre" subtitle="Stay informed about your trading activity"><MenuRow icon={<BellRing/>} title="Trading alerts" description="Signals, orders, positions, targets and stop losses" onClick={() => go('alerts')}/><MenuRow icon={<CircleAlert/>} title="Exceptions" description="Rejected orders, API failures and exchange issues" onClick={() => go('exceptions')}/><MenuRow icon={<Shield/>} title="Account notifications" description="Subscription, security and service messages" onClick={() => go('preferences')}/></Page>}
+      {tab === 'exceptions' && <Page title="Exceptions" subtitle="Operational issues and important warnings"><div className="empty-state"><CheckCircle2 size={34}/><b>No exceptions displayed</b><p>Connect your notification event service to show account-specific exceptions here.</p></div></Page>}
+      {tab === 'settings' && <Page title="Settings" subtitle="Manage your account and trading preferences"><MenuRow icon={<ArrowLeftRight/>} title="Choose exchange" description={`Currently using ${mode === 'paper' ? 'Paper Exchange' : 'Live CoinDCX'}`} onClick={() => go('exchange')}/><MenuRow icon={<CreditCard/>} title="Choose plan" description="View plans, limits and renewal date" onClick={() => go('plan')}/><MenuRow icon={<Bell/>} title="Enable alerts" description={alertsEnabled ? 'Notifications are enabled' : 'Notifications are paused'} onClick={() => go('preferences')}/><MenuRow icon={<UserRound/>} title="Profile" description="Credentials and connectivity tests" onClick={() => go('profile')}/><MenuRow icon={<LogOut/>} title="Logout" description="End this application session" onClick={() => void doLogout()}/></Page>}
+      {tab === 'exchange' && <Page title="Choose exchange" subtitle="Select where your trading activity takes place"><div className={`choice-card ${mode === 'live' ? 'selected' : ''}`} onClick={() => setConfirmMode('live')}><div className="choice-icon live-icon"><Activity/></div><div className="choice-copy"><b>Live CoinDCX</b><span>Requires API key, API secret and successful connectivity test</span></div>{mode === 'live' && <CheckCircle2 className="selected-check"/>}</div><div className={`choice-card ${mode === 'paper' ? 'selected' : ''}`} onClick={() => setConfirmMode('paper')}><div className="choice-icon paper-icon"><Shield/></div><div className="choice-copy"><b>Paper Exchange</b><span>Simulated trading without exchange credentials</span></div>{mode === 'paper' && <CheckCircle2 className="selected-check"/>}</div>{confirmMode && <div className="confirm-box"><b>Exchange switching is currently protected</b><p>Switching remains disabled until active-order and active-position checks are implemented.</p><div className="button-row"><button className="btn-secondary" onClick={() => setConfirmMode(null)}>Close</button><button className="btn-primary" onClick={() => void saveExchange()}>Continue</button></div></div>}</Page>}
+      {tab === 'plan' && <Page title="Subscription plan" subtitle="Your access and trading limits"><div className="plan-card"><span className="plan-label">CURRENT PLAN</span><h2>Connect your plan</h2><p>Plan name, validity, renewal and limits will be loaded from your subscription service.</p></div></Page>}
+      {tab === 'preferences' && <Page title="Alert preferences" subtitle="Choose which updates you want to receive"><Toggle label="Trading alerts" description="Signals, orders and positions" value={preferences.trading_alerts} onChange={async v => { const next={...preferences,trading_alerts:v}; setPreferences(next); setAlertsEnabled(v); await saveAlertPreferences(next) }}/><Toggle label="Exceptions" description="Execution failures and exchange problems" value={preferences.exceptions} onChange={async v => { const next={...preferences,exceptions:v}; setPreferences(next); await saveAlertPreferences(next) }}/><Toggle label="Account notifications" description="Subscription and security updates" value={preferences.account_notifications} onChange={async v => { const next={...preferences,account_notifications:v}; setPreferences(next); await saveAlertPreferences(next) }}/></Page>}
+      {tab === 'profile' && <Page title="My profile" subtitle="Manage optional exchange and Telegram integrations">
+        <div className="profile-card"><div className="avatar">{(profile?.full_name || name).slice(0,1).toUpperCase()}</div><h2>{profile?.full_name || name}</h2><span>{profile?.email || ''}</span><small>Telegram ID: {profile?.telegram_chat_id || '—'}</small></div>
+        <div className="profile-section"><h3><PlugZap size={17}/> CoinDCX exchange credentials</h3><p>Optional for registration and Paper Exchange. Required for Live trading.</p><label>API Key {profile?.coindcx_api_key_masked && <small>Saved: {profile.coindcx_api_key_masked}</small>}</label><input value={apiKey} onChange={e=>setApiKey(e.target.value)} placeholder="Enter CoinDCX API key" autoComplete="off"/><label>API Secret</label><input value={apiSecret} onChange={e=>setApiSecret(e.target.value)} placeholder="Enter CoinDCX API secret" type="password" autoComplete="new-password"/><div className="status-line"><span>Connectivity</span><b className={profile?.exchange_connection_status==='connected'?'status-ok':'status-pending'}>{profile?.exchange_connection_status || 'untested'}</b></div><button className="btn-secondary full" disabled={busy} onClick={()=>void runConnectionTest('exchange')}>Test CoinDCX connection</button></div>
+        <div className="profile-section"><h3><Send size={17}/> Telegram bot connectivity</h3><p>Optional customer-owned Telegram bot. Start that bot from your Telegram account before testing delivery.</p><label>Customer Telegram Bot Token</label><input value={telegramToken} onChange={e=>setTelegramToken(e.target.value)} placeholder={profile?.telegram_bot_configured?'Token saved (enter new token to replace)':'Enter Telegram bot token'} type="password" autoComplete="new-password"/><div className="status-line"><span>Connectivity</span><b className={profile?.telegram_connection_status==='connected'?'status-ok':'status-pending'}>{profile?.telegram_connection_status || 'untested'}</b></div><button className="btn-secondary full" disabled={busy} onClick={()=>void runConnectionTest('telegram')}>Test Telegram connection</button></div>
+        <button className="btn-primary full" disabled={busy || (!apiKey && !apiSecret && !telegramToken)} onClick={()=>void saveCredentials()}>{busy?'Please wait…':'Save credentials'}</button>
+        <p className="muted-note">Secrets are never returned to the Mini App. Changing credentials invalidates the previous connectivity test. Live trading is blocked until the exchange test succeeds.</p>
+      </Page>}
+    </main>
+    <nav className="bottom-nav"><NavButton active={tab === 'home'} icon={<LayoutDashboard/>} label="Home" onClick={() => go('home')}/><NavButton active={tab === 'positions'} icon={<Layers/>} label="Positions" onClick={() => go('positions')}/><NavButton active={tab === 'orders'} icon={<ClipboardList/>} label="Orders" onClick={() => go('orders')}/><NavButton active={['alerts','exceptions'].includes(tab)} icon={<Bell/>} label="Alerts" onClick={() => go('alerts')}/><NavButton active={['settings','exchange','plan','preferences','profile'].includes(tab)} icon={<RefreshCw/>} label="Settings" onClick={() => go('settings')}/></nav>
+  </div>
+}
+
+function ActivityValue({label,value}:{label:string;value:unknown}) {
+  return <div className="activity-value"><span>{label}</span><b>{value == null || value === '' ? '—' : String(value)}</b></div>
+}
+
+function Stat({icon,label,value}:{icon:React.ReactNode;label:string;value:string}) { return <div className="stat-card"><div className="stat-icon">{icon}</div><span>{label}</span><b>{value}</b></div> }
+function Quick({icon,title,subtitle,onClick}:{icon:React.ReactNode;title:string;subtitle:string;onClick:()=>void}) { return <button className="quick-card" onClick={onClick}><span>{icon}</span><b>{title}</b><small>{subtitle}</small></button> }
+function Page({title,subtitle,children}:{title:string;subtitle:string;children:React.ReactNode}) { return <section><button className="back-link" onClick={() => history.back()}>‹ Back</button><div className="page-heading"><h1>{title}</h1><p>{subtitle}</p></div><div className="page-content">{children}</div></section> }
+function MenuRow({icon,title,description,onClick}:{icon:React.ReactNode;title:string;description:string;onClick?:()=>void}) { return <button className="menu-row" onClick={onClick}><span className="row-icon">{icon}</span><span className="row-copy"><b>{title}</b><small>{description}</small></span><ChevronRight size={18}/></button> }
+function Toggle({label,description,value,onChange}:{label:string;description:string;value:boolean;onChange:(v:boolean)=>void}) { return <div className="toggle-row"><span><b>{label}</b><small>{description}</small></span><button className={`switch ${value?'on':''}`} onClick={() => onChange(!value)} aria-label={`Toggle ${label}`}><i/></button></div> }
+function NavButton({active,icon,label,onClick}:{active:boolean;icon:React.ReactNode;label:string;onClick:()=>void}) { return <button className={`nav-button ${active?'active':''}`} onClick={onClick}>{icon}<span>{label}</span></button> }
